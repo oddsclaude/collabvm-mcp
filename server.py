@@ -46,8 +46,10 @@ class CollabVMConn:
         self.turn_event = threading.Event()
         self.frame = None
         self.frame_lock = threading.Lock()
+        self.chat_log = []  # list of {"user": str, "message": str}
+        self.chat_lock = threading.Lock()
 
-    def connect(self, url, vm_id):
+    def connect(self, url, vm_id, username=None, password=None):
         if self.ws:
             self.disconnect()
 
@@ -55,6 +57,8 @@ class CollabVMConn:
         ready = threading.Event()
 
         def on_open(ws):
+            if username and password:
+                ws.send(encode("login", username, password))
             ws.send(encode("connect", vm_id))
             self.connected = True
             ready.set()
@@ -90,6 +94,12 @@ class CollabVMConn:
                 elif len(parts) == 1:
                     self.has_turn = True
                     self.turn_event.set()
+
+            elif cmd == "chat" and len(parts) >= 3:
+                with self.chat_lock:
+                    self.chat_log.append({"user": parts[1], "message": parts[2]})
+                    if len(self.chat_log) > 200:
+                        self.chat_log = self.chat_log[-200:]
 
             elif cmd == "nop":
                 ws.send("3.nop;")
@@ -152,6 +162,14 @@ class CollabVMConn:
                 # Unicode keysym: 0x01000000 | codepoint
                 self.press_key(0x01000000 | ord(ch), delay)
 
+    def rename(self, username):
+        if self.ws:
+            self.ws.send(encode("rename", username))
+
+    def read_chat(self, n=50):
+        with self.chat_lock:
+            return list(self.chat_log[-n:])
+
     def send_chat(self, message):
         if self.ws:
             self.ws.send(encode("chat", message))
@@ -182,7 +200,7 @@ conn = CollabVMConn()
 TOOLS = [
     {
         "name": "cvm_connect",
-        "description": "Connect to a CollabVM VM. Server URL is the WebSocket base URL.",
+        "description": "Connect to a CollabVM VM. Optionally authenticate with username+password.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -193,6 +211,14 @@ TOOLS = [
                 "vm_id": {
                     "type": "string",
                     "description": "VM identifier e.g. vm3",
+                },
+                "username": {
+                    "type": "string",
+                    "description": "Account username (optional, for registered accounts)",
+                },
+                "password": {
+                    "type": "string",
+                    "description": "Account password (optional)",
                 },
             },
             "required": ["server_url", "vm_id"],
@@ -253,6 +279,25 @@ TOOLS = [
         },
     },
     {
+        "name": "cvm_rename",
+        "description": "Set the display username shown in the VM.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"username": {"type": "string"}},
+            "required": ["username"],
+        },
+    },
+    {
+        "name": "cvm_read_chat",
+        "description": "Read recent chat messages from the VM chat log.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "n": {"type": "integer", "description": "Number of recent messages to return (default 50)"},
+            },
+        },
+    },
+    {
         "name": "cvm_disconnect",
         "description": "Disconnect from the VM.",
         "inputSchema": {"type": "object", "properties": {}},
@@ -262,7 +307,10 @@ TOOLS = [
 
 def call_tool(name, args):
     if name == "cvm_connect":
-        ok = conn.connect(args["server_url"], args["vm_id"])
+        ok = conn.connect(
+            args["server_url"], args["vm_id"],
+            args.get("username"), args.get("password"),
+        )
         return text_result(f"{'Connected' if ok else 'Failed to connect'} to {args['vm_id']}")
 
     if name == "cvm_take_turn":
@@ -293,6 +341,15 @@ def call_tool(name, args):
     if name == "cvm_chat":
         conn.send_chat(args["message"])
         return text_result("Chat sent")
+
+    if name == "cvm_rename":
+        conn.rename(args["username"])
+        return text_result(f"Renamed to {args['username']}")
+
+    if name == "cvm_read_chat":
+        messages = conn.read_chat(args.get("n", 50))
+        lines = [f"<{m['user']}> {m['message']}" for m in messages]
+        return text_result("\n".join(lines) if lines else "(no messages)")
 
     if name == "cvm_disconnect":
         conn.disconnect()
