@@ -49,17 +49,20 @@ class CollabVMConn:
         self.chat_log = []  # list of {"user": str, "message": str}
         self.chat_lock = threading.Lock()
 
-    def connect(self, url, vm_id, username=None, password=None):
+    def connect(self, url, vm_id, token=None, display_name=None):
         if self.ws:
             self.disconnect()
 
         self.connected = False
+        self._display_name = display_name
         ready = threading.Event()
 
         def on_open(ws):
-            if username and password:
-                ws.send(encode("login", username, password))
+            if token:
+                ws.send(encode("login", token))
             ws.send(encode("connect", vm_id))
+            if display_name:
+                ws.send(encode("rename", display_name))
             self.connected = True
             ready.set()
 
@@ -87,13 +90,20 @@ class CollabVMConn:
                     self.frame = Image.new("RGB", (w, h), "black")
 
             elif cmd == "turn":
-                # turn,0 = turn acquired; turn,N = N people ahead
-                if len(parts) >= 2 and parts[1] == "0":
-                    self.has_turn = True
-                    self.turn_event.set()
-                elif len(parts) == 1:
-                    self.has_turn = True
-                    self.turn_event.set()
+                # Server sends: turn,TIMER,COUNT,USER1,...
+                # COUNT=0 means no one has the turn (cleared)
+                # We detect our turn by checking if we're first in the user list
+                if len(parts) >= 3:
+                    count = int(parts[2])
+                    if count > 0 and len(parts) >= 4:
+                        first_user = parts[3]
+                        if self._display_name and first_user == self._display_name:
+                            self.has_turn = True
+                            self.turn_event.set()
+                        elif not self._display_name:
+                            # No display name set - optimistically assume turn is ours
+                            self.has_turn = True
+                            self.turn_event.set()
 
             elif cmd == "chat" and len(parts) >= 3:
                 with self.chat_lock:
@@ -132,7 +142,7 @@ class CollabVMConn:
             return False
         self.turn_event.clear()
         self.has_turn = False
-        self.ws.send(encode("turn"))
+        self.ws.send(encode("turn", "1"))
         return self.turn_event.wait(timeout=timeout)
 
     def end_turn(self):
@@ -142,7 +152,7 @@ class CollabVMConn:
 
     def send_key(self, keysym, down=True):
         if self.ws:
-            self.ws.send(encode("key", "1" if down else "0", str(keysym)))
+            self.ws.send(encode("key", str(keysym), "1" if down else "0"))
 
     def press_key(self, keysym, delay=0.05):
         self.send_key(keysym, True)
@@ -212,13 +222,13 @@ TOOLS = [
                     "type": "string",
                     "description": "VM identifier e.g. vm3",
                 },
-                "username": {
+                "token": {
                     "type": "string",
-                    "description": "Account username (optional, for registered accounts)",
+                    "description": "Account auth token (optional, for registered accounts)",
                 },
-                "password": {
+                "display_name": {
                     "type": "string",
-                    "description": "Account password (optional)",
+                    "description": "Display name to use in the VM (optional, server assigns guest name otherwise)",
                 },
             },
             "required": ["server_url", "vm_id"],
@@ -309,7 +319,7 @@ def call_tool(name, args):
     if name == "cvm_connect":
         ok = conn.connect(
             args["server_url"], args["vm_id"],
-            args.get("username"), args.get("password"),
+            args.get("token"), args.get("display_name"),
         )
         return text_result(f"{'Connected' if ok else 'Failed to connect'} to {args['vm_id']}")
 
