@@ -2,6 +2,7 @@
 """CollabVM MCP Server - control CollabVM VMs as MCP tools"""
 
 import json
+import os
 import sys
 import threading
 import time
@@ -9,6 +10,15 @@ import base64
 from io import BytesIO
 from PIL import Image
 import websocket
+
+# Load default token from config.json next to this file or COLLABVM_TOKEN env var
+_config_path = os.path.join(os.path.dirname(__file__), "config.json")
+_default_token = os.environ.get("COLLABVM_TOKEN")
+if not _default_token and os.path.exists(_config_path):
+    try:
+        _default_token = json.load(open(_config_path)).get("token")
+    except Exception:
+        pass
 
 
 # --- Guacamole protocol ---
@@ -53,18 +63,22 @@ class CollabVMConn:
         if self.ws:
             self.disconnect()
 
+        # VM ID goes in the URL path: wss://host/path/vm3
+        if not url.endswith("/"):
+            url = url + "/"
+        url = url + vm_id
+
         self.connected = False
         self._display_name = display_name
         ready = threading.Event()
 
         def on_open(ws):
-            if token:
-                ws.send(encode("login", token))
-            ws.send(encode("connect", vm_id))
-            if display_name:
-                ws.send(encode("rename", display_name))
             self.connected = True
             ready.set()
+            if token:
+                ws.send(encode("login", token))
+            if display_name:
+                ws.send(encode("rename", display_name))
 
         def on_message(ws, msg):
             parts = decode(msg)
@@ -127,10 +141,13 @@ class CollabVMConn:
             on_message=on_message,
             on_error=on_error,
             on_close=on_close,
-            header={"Origin": "https://computernewb.com"},
+            header={
+                "Origin": "https://computernewb.com",
+                "Sec-WebSocket-Protocol": "guacamole",
+            },
         )
         t = threading.Thread(
-            target=lambda: self.ws.run_forever(subprotocols=["guacamole"]),
+            target=lambda: self.ws.run_forever(),
             daemon=True,
         )
         t.start()
@@ -317,9 +334,10 @@ TOOLS = [
 
 def call_tool(name, args):
     if name == "cvm_connect":
+        token = args.get("token") or _default_token
         ok = conn.connect(
             args["server_url"], args["vm_id"],
-            args.get("token"), args.get("display_name"),
+            token, args.get("display_name"),
         )
         return text_result(f"{'Connected' if ok else 'Failed to connect'} to {args['vm_id']}")
 
